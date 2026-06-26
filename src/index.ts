@@ -1,34 +1,11 @@
 import type { Hooks, Plugin } from "@opencode-ai/plugin"
 
 const ENV_VAR_RE = /^([A-Za-z_][A-Za-z0-9_]*=[^\s]* +)*/
-const OPERATOR_RE = /(\s*(?:&&|\|\||;)\s*|\s&\s?|\r?\n)/
-const OPERATOR_ONLY_RE = /(\s*(?:&&|\|\||;)\s*|\s&\s?)/
+const OPERATOR_RE = /(\s*(?:&&|\|\||;)\s*|\s&(?![>])\s?|\r?\n)/
+const OPERATOR_ONLY_RE = /(\s*(?:&&|\|\||;)\s*|\s&(?![>])\s?)/
 const HEREDOC_RE = /<<-?\s*['"]?\w/
 const POWERSHELL_SKIP_RE = /^[$@&{]/
 const POWERSHELL_CMDLET_RE = /^[A-Z][a-zA-Z]*-[A-Z]/i
-
-function findFirstPipe(command: string): number {
-  let inSingleQuote = false
-  let inDoubleQuote = false
-
-  for (let i = 0; i < command.length; i++) {
-    const char = command[i]
-
-    if (char === "'" && !inDoubleQuote) {
-      inSingleQuote = !inSingleQuote
-    } else if (char === '"' && !inSingleQuote) {
-      inDoubleQuote = !inDoubleQuote
-    } else if (char === "|" && !inSingleQuote && !inDoubleQuote) {
-      if (command[i + 1] === "|" || (i > 0 && command[i - 1] === "|")) {
-        i++
-        continue
-      }
-      return i
-    }
-  }
-
-  return -1
-}
 
 function stripSnipPrefixes(cmd: string): string {
   let s = cmd.trimStart()
@@ -49,7 +26,7 @@ async function snipCommand(
 
   const firstWord = bareCmd.split(/\s+/)[0]
   if (process.platform === "win32" && POWERSHELL_SKIP_RE.test(bareCmd)) return command
-  if (POWERSHELL_CMDLET_RE.test(firstWord)) return command
+  if (process.platform === "win32" && POWERSHELL_CMDLET_RE.test(firstWord)) return command
 
   if (await shouldWrap(bareCmd)) {
     return `${envPrefix}snip run -- ${bareCmd}`
@@ -57,8 +34,14 @@ async function snipCommand(
   return command
 }
 
-function splitByPipe(command: string): string[] {
-  const parts: string[] = []
+interface PipeSplit {
+  segments: string[]
+  operators: string[]
+}
+
+function splitByPipe(command: string): PipeSplit {
+  const segments: string[] = []
+  const operators: string[] = []
   let current = ""
   let inSingleQuote = false
   let inDoubleQuote = false
@@ -72,34 +55,45 @@ function splitByPipe(command: string): string[] {
       inDoubleQuote = !inDoubleQuote
       current += char
     } else if (char === "|" && !inSingleQuote && !inDoubleQuote) {
-      if (command[i + 1] === "|" || (i > 0 && command[i - 1] === "|")) {
+      if (command[i + 1] === "|") {
         i++
         continue
       }
-      parts.push(current)
+      segments.push(current)
       current = ""
+      if (command[i + 1] === "&") {
+        operators.push("|&")
+        i++
+      } else {
+        operators.push("|")
+      }
     } else {
       current += char
     }
   }
-  parts.push(current)
-  return parts
+  segments.push(current)
+  return { segments, operators }
 }
 
 async function snipSegment(
   segment: string,
   shouldWrap: (cmd: string) => Promise<boolean>,
 ): Promise<string> {
-  const pipeIdx = findFirstPipe(segment)
-  if (pipeIdx !== -1) {
-    const parts = splitByPipe(segment)
-    const results: string[] = []
-    for (const part of parts) {
-      results.push(await snipCommand(part.trim(), shouldWrap))
-    }
-    return results.join(" | ")
+  if (HEREDOC_RE.test(segment)) {
+    return snipCommand(segment, shouldWrap)
   }
-  return snipCommand(segment, shouldWrap)
+
+  const { segments, operators } = splitByPipe(segment)
+  if (segments.length === 1) {
+    return snipCommand(segment, shouldWrap)
+  }
+
+  let result = await snipCommand(segments[0].trim(), shouldWrap)
+  for (let i = 1; i < segments.length; i++) {
+    result += ` ${operators[i - 1]} `
+    result += await snipCommand(segments[i].trim(), shouldWrap)
+  }
+  return result
 }
 
 export function createToolExecuteBefore(shouldWrap: (cmd: string) => Promise<boolean>) {
@@ -175,13 +169,8 @@ export const SnipPlugin: Plugin = async ({ $, client }) => {
 
   const shouldWrap = async (cmd: string): Promise<boolean> => {
     try {
-      const words = cmd.split(/\s+/)
-      const w0 = { raw: words[0] }
-      const w1 = words.length > 1 ? { raw: words[1] } : undefined
-      const result =
-        w1 !== undefined
-          ? await $`snip check -- ${w0} ${w1}`.nothrow().quiet()
-          : await $`snip check -- ${w0}`.nothrow().quiet()
+      const firstWord = cmd.split(/\s+/)[0]
+      const result = await $`snip check -- ${{ raw: firstWord }}`.nothrow().quiet()
       return result.exitCode === 0
     } catch (err) {
       await client.app

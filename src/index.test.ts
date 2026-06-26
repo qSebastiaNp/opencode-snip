@@ -42,6 +42,12 @@ describe("toolExecuteBefore", () => {
     expect(mockOutput.args.command).toBe("snip run -- git log | snip run -- head")
   })
 
+  it("should handle command with |&", async () => {
+    mockOutput.args.command = "cmd1 |& cmd2"
+    await createToolExecuteBefore(mockedWrap)(mockInput, mockOutput)
+    expect(mockOutput.args.command).toBe("snip run -- cmd1 |& snip run -- cmd2")
+  })
+
   it("should handle command with ;", async () => {
     mockOutput.args.command = "go test; go build"
     await createToolExecuteBefore(mockedWrap)(mockInput, mockOutput)
@@ -58,6 +64,12 @@ describe("toolExecuteBefore", () => {
     mockOutput.args.command = "sleep 1 & sleep 2 &"
     await createToolExecuteBefore(mockedWrap)(mockInput, mockOutput)
     expect(mockOutput.args.command).toBe("snip run -- sleep 1 & snip run -- sleep 2 &")
+  })
+
+  it("should not treat &> as background operator", async () => {
+    mockOutput.args.command = "cmd &> out.log"
+    await createToolExecuteBefore(mockedWrap)(mockInput, mockOutput)
+    expect(mockOutput.args.command).toBe("snip run -- cmd &> out.log")
   })
 
   it("should handle mixed operators", async () => {
@@ -151,6 +163,18 @@ describe("toolExecuteBefore", () => {
       await createToolExecuteBefore(mockedWrap)(mockInput, mockOutput)
       expect(mockOutput.args.command).toBe("snip run -- cmd1 2>&1 && snip run -- cmd2")
     })
+
+    it("should not treat &> as background operator", async () => {
+      mockOutput.args.command = "cmd &> out.log"
+      await createToolExecuteBefore(mockedWrap)(mockInput, mockOutput)
+      expect(mockOutput.args.command).toBe("snip run -- cmd &> out.log")
+    })
+
+    it("should not treat &> in compound command as background", async () => {
+      mockOutput.args.command = "cmd1 &> out.log && cmd2"
+      await createToolExecuteBefore(mockedWrap)(mockInput, mockOutput)
+      expect(mockOutput.args.command).toBe("snip run -- cmd1 &> out.log && snip run -- cmd2")
+    })
   })
 
   describe("pipe expressions with quotes", () => {
@@ -188,6 +212,12 @@ describe("toolExecuteBefore", () => {
       mockOutput.args.command = 'echo "hello | world" | cat'
       await createToolExecuteBefore(mockedWrap)(mockInput, mockOutput)
       expect(mockOutput.args.command).toBe('snip run -- echo "hello | world" | snip run -- cat')
+    })
+
+    it("should preserve |& operator between pipe segments", async () => {
+      mockOutput.args.command = "cmd1 |& cmd2"
+      await createToolExecuteBefore(mockedWrap)(mockInput, mockOutput)
+      expect(mockOutput.args.command).toBe("snip run -- cmd1 |& snip run -- cmd2")
     })
   })
 
@@ -339,6 +369,28 @@ describe("toolExecuteBefore", () => {
     })
   })
 
+  describe("Unix commands not matching cmdlet regex", () => {
+    const isWin32 = process.platform === "win32"
+
+    it.skipIf(isWin32)("should wrap apt-get (not matched as cmdlet on non-Windows)", async () => {
+      mockOutput.args.command = "apt-get install foo"
+      await createToolExecuteBefore(mockedWrap)(mockInput, mockOutput)
+      expect(mockOutput.args.command).toBe("snip run -- apt-get install foo")
+    })
+
+    it.skipIf(isWin32)("should wrap node-gyp (not matched as cmdlet on non-Windows)", async () => {
+      mockOutput.args.command = "node-gyp rebuild"
+      await createToolExecuteBefore(mockedWrap)(mockInput, mockOutput)
+      expect(mockOutput.args.command).toBe("snip run -- node-gyp rebuild")
+    })
+
+    it.skipIf(isWin32)("should wrap pkg-config (not matched as cmdlet on non-Windows)", async () => {
+      mockOutput.args.command = "pkg-config --libs openssl"
+      await createToolExecuteBefore(mockedWrap)(mockInput, mockOutput)
+      expect(mockOutput.args.command).toBe("snip run -- pkg-config --libs openssl")
+    })
+  })
+
   describe("newline splitting (PR #21)", () => {
     it("should split and snip commands separated by newlines", async () => {
       mockOutput.args.command = "git log\ngit status"
@@ -387,6 +439,12 @@ describe("toolExecuteBefore", () => {
       mockOutput.args.command = "cat <<'EOF'\nhello world\nEOF"
       await createToolExecuteBefore(mockedWrap)(mockInput, mockOutput)
       expect(mockOutput.args.command).toBe("snip run -- cat <<'EOF'\nhello world\nEOF")
+    })
+
+    it("should not split pipes inside heredoc body", async () => {
+      mockOutput.args.command = "cat <<EOF\nleft | right\nEOF"
+      await createToolExecuteBefore(mockedWrap)(mockInput, mockOutput)
+      expect(mockOutput.args.command).toBe("snip run -- cat <<EOF\nleft | right\nEOF")
     })
 
     it("should still split operators when heredoc is present", async () => {
