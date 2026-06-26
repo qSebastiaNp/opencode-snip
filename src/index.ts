@@ -4,6 +4,7 @@ const ENV_VAR_RE = /^([A-Za-z_][A-Za-z0-9_]*=[^\s]* +)*/
 const OPERATOR_RE = /(\s*(?:&&|\|\||;)\s*|\s&(?![>])\s?|\r?\n)/
 const OPERATOR_ONLY_RE = /(\s*(?:&&|\|\||;)\s*|\s&(?![>])\s?)/
 const HEREDOC_RE = /<<-?\s*['"]?\w/
+const HEREDOC_DELIM_RE = /<<-?\s*['"]?(\w[\w.-]*)/
 const POWERSHELL_SKIP_RE = /^[$@&{]/
 const POWERSHELL_CMDLET_RE = /^[A-Z][a-zA-Z]*-[A-Z]/i
 
@@ -108,8 +109,33 @@ export function createToolExecuteBefore(shouldWrap: (cmd: string) => Promise<boo
       if (!command || typeof command !== "string") return
       if (command.startsWith("snip run -- ")) return
 
-      const separator = HEREDOC_RE.test(command) ? OPERATOR_ONLY_RE : OPERATOR_RE
-      const segments = command.split(separator)
+      if (HEREDOC_RE.test(command)) {
+        const heredocMatch = command.match(HEREDOC_DELIM_RE)
+        if (heredocMatch) {
+          const delimiter = heredocMatch[1]
+          const bodyStart = heredocMatch.index! + heredocMatch[0].length
+          const bodyEnd = command.indexOf(delimiter, bodyStart)
+          if (bodyEnd !== -1) {
+            const heredocPart = command.slice(0, bodyEnd + delimiter.length)
+            const afterPart = command.slice(bodyEnd + delimiter.length)
+            const afterSegments = afterPart.split(OPERATOR_RE)
+            const results: string[] = [await snipSegment(heredocPart, shouldWrap)]
+            for (const seg of afterSegments) {
+              if (OPERATOR_RE.test(seg)) {
+                results.push(seg)
+              } else if (seg) {
+                results.push(await snipSegment(seg, shouldWrap))
+              }
+            }
+            output.args.command = results.join("")
+            return
+          }
+        }
+        output.args.command = await snipSegment(command, shouldWrap)
+        return
+      }
+
+      const segments = command.split(OPERATOR_RE)
 
       if (segments.length === 1) {
         output.args.command = await snipSegment(command, shouldWrap)
@@ -118,7 +144,7 @@ export function createToolExecuteBefore(shouldWrap: (cmd: string) => Promise<boo
 
       const results: string[] = []
       for (const segment of segments) {
-        if (separator.test(segment)) {
+        if (OPERATOR_RE.test(segment)) {
           results.push(segment)
         } else {
           results.push(await snipSegment(segment, shouldWrap))
@@ -169,8 +195,7 @@ export const SnipPlugin: Plugin = async ({ $, client }) => {
 
   const shouldWrap = async (cmd: string): Promise<boolean> => {
     try {
-      const firstWord = cmd.split(/\s+/)[0]
-      const result = await $`snip check -- ${{ raw: firstWord }}`.nothrow().quiet()
+      const result = await $`snip check -- ${{ raw: cmd }}`.nothrow().quiet()
       return result.exitCode === 0
     } catch (err) {
       await client.app

@@ -452,6 +452,18 @@ describe("toolExecuteBefore", () => {
       await createToolExecuteBefore(mockedWrap)(mockInput, mockOutput)
       expect(mockOutput.args.command).toBe("snip run -- cat <<EOF\ndata\nEOF && snip run -- echo done")
     })
+
+    it("should not split operators inside heredoc body", async () => {
+      mockOutput.args.command = "cat <<EOF\na && b\nEOF"
+      await createToolExecuteBefore(mockedWrap)(mockInput, mockOutput)
+      expect(mockOutput.args.command).toBe("snip run -- cat <<EOF\na && b\nEOF")
+    })
+
+    it("should not split semicolons inside heredoc body", async () => {
+      mockOutput.args.command = "cat <<EOF\na; b\nEOF"
+      await createToolExecuteBefore(mockedWrap)(mockInput, mockOutput)
+      expect(mockOutput.args.command).toBe("snip run -- cat <<EOF\na; b\nEOF")
+    })
   })
 })
 
