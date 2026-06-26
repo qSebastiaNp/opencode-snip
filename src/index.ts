@@ -1,79 +1,211 @@
 import type { Hooks, Plugin } from "@opencode-ai/plugin"
 
 const ENV_VAR_RE = /^([A-Za-z_][A-Za-z0-9_]*=[^\s]* +)*/
-const UNPROXYABLE_COMMANDS = new Set([
-  "cd", "source", ".", "export", "alias", "unset", "set", "shopt", "eval", "exec",
-])
-const OPERATOR_RE = /(\s*(?:&&|\|\||;)\s*|\s&\s?)/
+const OPERATOR_RE = /(\s*(?:&&|\|\||;)\s*|\s&\s?|\r?\n)/
+const OPERATOR_ONLY_RE = /(\s*(?:&&|\|\||;)\s*|\s&\s?)/
+const HEREDOC_RE = /<<-?\s*['"]?\w/
+const POWERSHELL_SKIP_RE = /^[$@&{]/
+const POWERSHELL_CMDLET_RE = /^[A-Z][a-zA-Z]*-[A-Z]/i
 
 function findFirstPipe(command: string): number {
   let inSingleQuote = false
   let inDoubleQuote = false
-  
+
   for (let i = 0; i < command.length; i++) {
     const char = command[i]
-    
+
     if (char === "'" && !inDoubleQuote) {
       inSingleQuote = !inSingleQuote
     } else if (char === '"' && !inSingleQuote) {
       inDoubleQuote = !inDoubleQuote
-    } else if (char === '|' && !inSingleQuote && !inDoubleQuote) {
-      if (command[i + 1] === '|' || (i > 0 && command[i - 1] === '|')) {
+    } else if (char === "|" && !inSingleQuote && !inDoubleQuote) {
+      if (command[i + 1] === "|" || (i > 0 && command[i - 1] === "|")) {
         i++
         continue
       }
       return i
     }
   }
-  
+
   return -1
 }
 
-function snipCommand(command: string): string {
+function stripSnipPrefixes(cmd: string): string {
+  let s = cmd.trimStart()
+  while (s.startsWith("snip ")) {
+    s = s.slice(5).trimStart()
+  }
+  return s
+}
+
+async function snipCommand(
+  command: string,
+  shouldWrap: (cmd: string) => Promise<boolean>,
+): Promise<string> {
   const envPrefix = (command.match(ENV_VAR_RE) ?? [""])[0]
-  const bareCmd = command.slice(envPrefix.length).trim()
+  const bareCmd = stripSnipPrefixes(command.slice(envPrefix.length).trim())
   if (!bareCmd) return command
-  if (UNPROXYABLE_COMMANDS.has(bareCmd.split(/\s+/)[0])) return command
-  return `${envPrefix}snip ${bareCmd}`
+  if (bareCmd.startsWith("snip ") || bareCmd.startsWith("run -- ")) return command
+
+  const firstWord = bareCmd.split(/\s+/)[0]
+  if (process.platform === "win32" && POWERSHELL_SKIP_RE.test(bareCmd)) return command
+  if (POWERSHELL_CMDLET_RE.test(firstWord)) return command
+
+  if (await shouldWrap(bareCmd)) {
+    return `${envPrefix}snip run -- ${bareCmd}`
+  }
+  return command
 }
 
-export const toolExecuteBefore: NonNullable<Hooks["tool.execute.before"]> = async (input, output) => {
-  if (input.tool !== "bash") return
+function splitByPipe(command: string): string[] {
+  const parts: string[] = []
+  let current = ""
+  let inSingleQuote = false
+  let inDoubleQuote = false
 
-  const command = output.args.command
-  if (!command || typeof command !== "string") return
-  if (command.startsWith("snip ")) return
-
-  if (findFirstPipe(command) !== -1) {
-    const pipeIdx = findFirstPipe(command)
-    const firstCmd = command.slice(0, pipeIdx).trimEnd()
-    const rest = command.slice(pipeIdx)
-    output.args.command = snipCommand(firstCmd) + ' ' + rest
-    return
+  for (let i = 0; i < command.length; i++) {
+    const char = command[i]
+    if (char === "'" && !inDoubleQuote) {
+      inSingleQuote = !inSingleQuote
+      current += char
+    } else if (char === '"' && !inSingleQuote) {
+      inDoubleQuote = !inDoubleQuote
+      current += char
+    } else if (char === "|" && !inSingleQuote && !inDoubleQuote) {
+      if (command[i + 1] === "|" || (i > 0 && command[i - 1] === "|")) {
+        i++
+        continue
+      }
+      parts.push(current)
+      current = ""
+    } else {
+      current += char
+    }
   }
-
-  const segments = command.split(OPERATOR_RE)
-
-  if (segments.length === 1) {
-    output.args.command = snipCommand(command)
-    return
-  }
-
-  output.args.command = segments
-    .map((segment) => OPERATOR_RE.test(segment) ? segment : snipCommand(segment))
-    .join("")
+  parts.push(current)
+  return parts
 }
 
-export const SnipPlugin: Plugin = async ({ $ }) => {
+async function snipSegment(
+  segment: string,
+  shouldWrap: (cmd: string) => Promise<boolean>,
+): Promise<string> {
+  const pipeIdx = findFirstPipe(segment)
+  if (pipeIdx !== -1) {
+    const parts = splitByPipe(segment)
+    const results: string[] = []
+    for (const part of parts) {
+      results.push(await snipCommand(part.trim(), shouldWrap))
+    }
+    return results.join(" | ")
+  }
+  return snipCommand(segment, shouldWrap)
+}
+
+export function createToolExecuteBefore(shouldWrap: (cmd: string) => Promise<boolean>) {
+  return async (
+    input: Parameters<NonNullable<Hooks["tool.execute.before"]>>[0],
+    output: Parameters<NonNullable<Hooks["tool.execute.before"]>>[1],
+  ) => {
+    try {
+      if (input.tool !== "bash") return
+
+      const command = output.args.command
+      if (!command || typeof command !== "string") return
+      if (command.startsWith("snip run -- ")) return
+
+      const separator = HEREDOC_RE.test(command) ? OPERATOR_ONLY_RE : OPERATOR_RE
+      const segments = command.split(separator)
+
+      if (segments.length === 1) {
+        output.args.command = await snipSegment(command, shouldWrap)
+        return
+      }
+
+      const results: string[] = []
+      for (const segment of segments) {
+        if (separator.test(segment)) {
+          results.push(segment)
+        } else {
+          results.push(await snipSegment(segment, shouldWrap))
+        }
+      }
+      output.args.command = results.join("")
+    } catch {
+      // leave command unmodified on any unexpected error
+    }
+  }
+}
+
+export async function hasSnipSubcommands($: any): Promise<boolean> {
   try {
-    await $`which snip`.quiet()
+    await $`snip check -- ls`.nothrow().quiet()
+    return true
   } catch {
-    console.warn("[snip] snip binary not found in PATH — plugin disabled")
+    return false
+  }
+}
+
+export const SnipPlugin: Plugin = async ({ $, client }) => {
+  try {
+    if (process.platform === "win32") {
+      await $`where snip`.quiet()
+    } else {
+      await $`which snip`.quiet()
+    }
+  } catch {
+    await client.app
+      .log({ body: { service: "snip", level: "warn", message: "[snip] snip binary not found in PATH — plugin disabled" } })
+      .catch(() => {})
     return {}
   }
 
+  if (!(await hasSnipSubcommands($))) {
+    await client.app
+      .log({
+        body: {
+          service: "snip",
+          level: "warn",
+          message: "[snip] snip >= 0.16.0 required (snip check/run subcommands missing) — plugin disabled",
+        },
+      })
+      .catch(() => {})
+    return {}
+  }
+
+  const shouldWrap = async (cmd: string): Promise<boolean> => {
+    try {
+      const words = cmd.split(/\s+/)
+      const w0 = { raw: words[0] }
+      const w1 = words.length > 1 ? { raw: words[1] } : undefined
+      const result =
+        w1 !== undefined
+          ? await $`snip check -- ${w0} ${w1}`.nothrow().quiet()
+          : await $`snip check -- ${w0}`.nothrow().quiet()
+      return result.exitCode === 0
+    } catch (err) {
+      await client.app
+        .log({
+          body: {
+            service: "snip",
+            level: "warn",
+            message: `[snip] snip check failed for ${cmd}`,
+            extra: { error: String(err) },
+          },
+        })
+        .catch(() => {})
+      return false
+    }
+  }
+
   return {
-    "tool.execute.before": toolExecuteBefore,
+    "tool.execute.before": createToolExecuteBefore(shouldWrap),
+    "experimental.chat.system.transform": async (_input, output) => {
+      output.system.push(
+        "The snip plugin automatically prefixes eligible commands with `snip run --`. "
+          + "Do NOT manually add `snip run --` to commands.",
+      )
+    },
   }
 }
 
